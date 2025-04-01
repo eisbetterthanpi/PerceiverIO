@@ -6,6 +6,11 @@ from torch import nn
 import torch.nn.functional as F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def zero_module(module):
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
 class Attention(nn.Module):
     # def __init__(self, d_model, cond_dim=None, n_heads=None, d_head=8, dropout=0.): # .1
     def __init__(self, query_dim, cond_dim=None, n_heads=8, d_head=64, drop=0):
@@ -17,8 +22,8 @@ class Attention(nn.Module):
         self.cond_dim = cond_dim
         self.q = nn.Linear(query_dim, d_model, bias=False)
         self.kv = nn.Linear(cond_dim or query_dim, 2*d_model, bias=False)
-        self.lin = nn.Linear(d_model, d_model)
-        # self.lin = zero_module(nn.Linear(d_model, d_model))
+        # self.lin = nn.Linear(d_model, d_model)
+        self.lin = zero_module(nn.Linear(d_model, d_model))
         self.drop = nn.Dropout(drop) # indp before q,k,v; after linout
         self.scale = self.d_head**-.5
 
@@ -58,44 +63,45 @@ class AttentionBlock(nn.Module):
         act = nn.ReLU()
         if ff_dim==None: ff_dim=d_model*4
         self.ff = nn.Sequential(
-            nn.RMSNorm(d_model), nn.Linear(d_model, ff_dim), act,
-            nn.RMSNorm(ff_dim), nn.Dropout(dropout), nn.Linear(ff_dim, d_model)
-            # nn.RMSNorm(d_model), act, nn.Linear(d_model, ff_dim),
-            # nn.RMSNorm(ff_dim), act, nn.Linear(ff_dim, d_model)
+            nn.RMSNorm(d_model), act, nn.Linear(d_model, ff_dim),
+            nn.RMSNorm(ff_dim), act, zero_module(nn.Linear(ff_dim, d_model))
         )
 
     def forward(self, x, cond=None, mask=None): # [b,c,h,w], [batch, num_tok, cond_dim], [batch,T]
-        if self.cond_dim==None: x = x + self.attn(self.norm1(x), mask) # maybe no res for decoder
+        if self.cond_dim==None: x = x + self.attn(self.norm1(x), mask)
         else: x = x + self.attn(self.norm1(x), self.norm2(cond), mask) # maybe no res for decoder
         x = x + self.ff(x) # maybe no ff for decoder?
         return x
-
 
 
 class PerceiverIO(nn.Module):
     def __init__(self, in_dim, query_dim, out_dim=None, depth=12, num_latents = 512, latent_dim=512,
         cross_heads=1, latent_heads=8):
         super().__init__()
-        self.latents = nn.Parameter(torch.randn(1, num_latents, latent_dim))
+        self.latent = nn.Parameter(torch.randn(1, num_latents, latent_dim))
+        # self.query = nn.Parameter(torch.randn(1, 1, query_dim))
         self.encode = AttentionBlock(latent_dim, cross_heads, cond_dim=in_dim)
         self.process = nn.Sequential(*[AttentionBlock(latent_dim, latent_heads) for _ in range(depth)])
         self.decode = AttentionBlock(query_dim, cross_heads, cond_dim=latent_dim)
         self.out = nn.Linear(query_dim, out_dim) if out_dim else nn.Identity()
 
-    def forward(self, x, latent=None, query=None, mask=None): # [b,t,dim]
-        latent = latent or self.latents
+    def forward(self, x, latent=None, query=None, mask=None): # [b,t,dim] , [1/b, num_latents, latent_dim], [1/b, query_len, query_dim], [b,t]
+        latent = latent or self.latent
         latent = self.encode(latent, cond=x, mask=mask)
         latent = self.process(latent)
-        if query==None: return latent
+        # if query==None: return latent
+        # query = query or self.query
         if query.ndim == 2: query = query.unsqueeze(0)
         out = self.decode(query, cond=latent)
         return self.out(out), latent
 
-in_dim=8
-query_dim=5
-model = PerceiverIO(in_dim, query_dim, out_dim = None, depth=2, num_latents=3, latent_dim=6, cross_heads=1, latent_heads=2)
-x = torch.rand(2,7,in_dim)
-c=torch.rand(3,query_dim)
+in_dim=1024
+query_dim=8
+# model = PerceiverIO(in_dim, query_dim, out_dim = None, depth=2, num_latents=3, latent_dim=6, cross_heads=1, latent_heads=2)
+model = PerceiverIO(in_dim, query_dim, out_dim = None, depth=4, num_latents=32, latent_dim=256, cross_heads=4, latent_heads=2)
+# cross_heads | in/query/out_dim
+x = torch.rand(128,7,in_dim)
+c=torch.rand(1,3,query_dim)
 out, latent = model(x, query=c)
-print(out.shape) # [batch, query_len, query_dim]
 print(latent.shape)
+print(out.shape) # [batch, query_len, query_dim]
